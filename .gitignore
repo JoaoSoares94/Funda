@@ -28,6 +28,9 @@ project.lock.json
 project.fragment.lock.json
 artifacts/
 
+# Visual Studio workspace files
+/.vs/
+
 # ASP.NET Scaffolding
 ScaffoldingReadMe.txt
 
@@ -38,6 +41,9 @@ ScaffoldingReadMe.txt
 
 # dotenv environment variables file
 .env
+
+# Local credentials (never include in submissions)
+/.local/
 
 # Others
 ~$*
