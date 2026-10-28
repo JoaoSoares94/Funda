@@ -4,5 +4,5 @@ public interface IListingSource
 {
     IAsyncEnumerable<Listing> GetListingsAsync(
         ListingSearch search,
-        CancellationToken cancellationToken = default);
+        CancellationToken cancellationToken);
 }

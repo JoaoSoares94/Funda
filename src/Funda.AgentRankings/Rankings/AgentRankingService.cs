@@ -4,13 +4,12 @@ namespace Funda.AgentRankings.Rankings;
 
 public sealed class AgentRankingService(IListingSource listingSource)
 {
+    private const int TopAgentCount = 10;
+
     public async Task<IReadOnlyList<AgentRanking>> GetTopAgentsAsync(
         ListingSearch search,
-        int limit = 10,
         CancellationToken cancellationToken = default)
     {
-        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(limit);
-
         var listingIds = new HashSet<string>(StringComparer.Ordinal);
         var agents = new Dictionary<int, AgentRanking>();
 
@@ -33,11 +32,10 @@ public sealed class AgentRankingService(IListingSource listingSource)
                 : new AgentRanking(listing.AgentId, listing.AgentName, 1);
         }
 
-        return agents.Values
+        return [.. agents.Values
             .OrderByDescending(agent => agent.ListingCount)
             .ThenBy(agent => agent.AgentName, StringComparer.Ordinal)
             .ThenBy(agent => agent.AgentId)
-            .Take(limit)
-            .ToArray();
+            .Take(TopAgentCount)];
     }
 }

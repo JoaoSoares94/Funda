@@ -5,22 +5,23 @@ using Funda.AgentRankings.Rankings;
 
 namespace Funda.AgentRankings;
 
-public sealed class RankingApplication(IListingSource listingSource, TextWriter output, TextWriter error)
+public sealed class RankingApplication(IListingSource listingSource, TextWriter output, TextWriter error,
+    ConsoleSearchProgress progress)
 {
     public async Task<int> RunAsync(CancellationToken cancellationToken = default)
     {
         try
         {
-            var service = new AgentRankingService(listingSource);
-            error.WriteLine("Fetching Amsterdam sale listings...");
-            var all = await service.GetTopAgentsAsync(
-                ListingSearch.Amsterdam, cancellationToken: cancellationToken);
-
-            error.WriteLine("Fetching Amsterdam sale listings with a garden...");
-            var garden = await service.GetTopAgentsAsync(
-                ListingSearch.AmsterdamWithGarden, cancellationToken: cancellationToken);
-
-            cancellationToken.ThrowIfCancellationRequested();
+            var (all, garden) = await progress.RunAsync(async () =>
+            {
+                var service = new AgentRankingService(listingSource);
+                var all = await service.GetTopAgentsAsync(
+                    ListingSearch.Amsterdam, cancellationToken: cancellationToken);
+                var garden = await service.GetTopAgentsAsync(
+                    ListingSearch.AmsterdamWithGarden, cancellationToken: cancellationToken);
+                cancellationToken.ThrowIfCancellationRequested();
+                return (all, garden);
+            });
 
             var report = new ConsoleReportWriter(output);
             report.Write("Top agents: Amsterdam sale listings", all);

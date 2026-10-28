@@ -10,9 +10,7 @@ internal static class FundaResponseJsonMother
           "Objects": [{
             "Id": "listing-1", "MakelaarId": 42, "MakelaarNaam": "Example Agent",
             "AanmeldDatum": "/Date(1262300400000+0100)/",
-            "ChildrenObjects": [{
-              "Id": "child-1", "MakelaarId": 42, "MakelaarNaam": "Example Agent"
-            }]
+            "ChildrenObjects": []
           }],
           "Paging": {
             "AantalPaginas": 226, "HuidigePagina": 1,
@@ -21,9 +19,6 @@ internal static class FundaResponseJsonMother
           "TotaalAantalObjecten": 5631
         }
         """;
-
-    public static string CreateWithMissingObjects() =>
-        CreateDefault().Replace("\"Objects\":", "\"UnexpectedObjects\":", StringComparison.Ordinal);
 
     public static string CreateWithEmptyResults() => """
         {

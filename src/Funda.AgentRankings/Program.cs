@@ -1,39 +1,57 @@
 using Funda.AgentRankings;
 using Funda.AgentRankings.Api;
-using Funda.AgentRankings.Configuration;
 using Funda.AgentRankings.Listings;
+using Funda.AgentRankings.Output;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Options;
 
-FundaOptions options;
+HostApplicationBuilder builder;
 try
 {
-    options = FundaOptions.FromEnvironment();
+    builder = Host.CreateApplicationBuilder(new HostApplicationBuilderSettings
+    {
+        DisableDefaults = true,
+        ContentRootPath = AppContext.BaseDirectory
+    });
+    builder.Configuration
+        .AddJsonFile(Path.Combine(AppContext.BaseDirectory, "appsettings.json"), optional: false)
+        .AddEnvironmentVariables();
 }
-catch (InvalidOperationException exception)
+catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidDataException)
 {
-    // Configuration validation errors name the setting without echoing its value.
-    Console.Error.WriteLine($"Configuration error: {exception.Message}");
+    Console.Error.WriteLine("Configuration error: appsettings.json could not be loaded. Check that the file exists and contains valid JSON.");
     return 2;
 }
 
-using var cancellation = new CancellationTokenSource();
-ConsoleCancelEventHandler cancelHandler = (_, eventArgs) =>
+var progress = new ConsoleSearchProgress(Console.Error, interactive: !Console.IsErrorRedirected);
+builder.Services.AddSingleton<IProgress<ListingSearchProgress>>(progress);
+builder.Services.AddFundaApi(builder.Configuration);
+using var host = builder.Build();
+var lifetime = host.Services.GetRequiredService<IHostApplicationLifetime>();
+try
 {
-    eventArgs.Cancel = true;
-    cancellation.Cancel();
-};
-Console.CancelKeyPress += cancelHandler;
+    await host.StartAsync();
+}
+catch (OptionsValidationException exception)
+{
+    Console.Error.WriteLine($"Configuration error: {exception.Message}");
+    return 2;
+}
+catch (OperationCanceledException) when (lifetime.ApplicationStopping.IsCancellationRequested)
+{
+    Console.Error.WriteLine("Search canceled. No complete report was produced.");
+    return 130;
+}
 
 try
 {
-    var services = new ServiceCollection();
-    services.AddFundaApi(options);
-    using var provider = services.BuildServiceProvider();
     var application = new RankingApplication(
-        provider.GetRequiredService<IListingSource>(), Console.Out, Console.Error);
-    return await application.RunAsync(cancellation.Token);
+        host.Services.GetRequiredService<IListingSource>(), Console.Out, Console.Error, progress);
+    return await application.RunAsync(lifetime.ApplicationStopping);
 }
 finally
 {
-    Console.CancelKeyPress -= cancelHandler;
+    await host.StopAsync();
 }

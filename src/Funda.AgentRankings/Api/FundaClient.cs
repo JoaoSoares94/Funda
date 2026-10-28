@@ -1,21 +1,22 @@
 using System.Globalization;
-using System.Net.Http.Headers;
+using System.Net.Http.Json;
 using System.Runtime.CompilerServices;
 using System.Text.Json;
 using Funda.AgentRankings.Api.Contracts;
 using Funda.AgentRankings.Configuration;
 using Funda.AgentRankings.Listings;
+using Polly.Timeout;
 
 namespace Funda.AgentRankings.Api;
 
 public sealed class FundaClient(HttpClient httpClient, FundaOptions options,
-    FundaRequestPolicy requestPolicy) : IListingSource
+    FundaRequestPolicy requestPolicy, IProgress<ListingSearchProgress> progress) : IListingSource
 {
-    private readonly FundaRequestPolicy _requestPolicy = requestPolicy;
+    private const int CompletePercentage = 100;
 
     public async IAsyncEnumerable<Listing> GetListingsAsync(
         ListingSearch search,
-        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         var query = search switch
         {
@@ -24,83 +25,101 @@ public sealed class FundaClient(HttpClient httpClient, FundaOptions options,
             _ => throw new ArgumentOutOfRangeException(nameof(search))
         };
 
-        int? totalPages = null;
-        var seenIds = new HashSet<string>(StringComparer.Ordinal);
+        cancellationToken.ThrowIfCancellationRequested();
+        ReportProgress(search, 0);
+        var properties = new PropertyListingCollection();
+        await foreach (var page in FetchPagesAsync(query, cancellationToken))
+        {
+            for (var index = 0; index < page.Objects.Length; index++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var item = page.Objects[index]
+                    ?? throw new FundaApiException($"The API returned a null listing on page {page.Number}, object {index + 1}.");
+                try
+                {
+                    properties.Add(item, cancellationToken);
+                }
+                catch (InvalidDataException)
+                {
+                    throw new FundaApiException($"The API returned an invalid listing identity on page {page.Number}, object {index + 1}.");
+                }
+            }
 
-        for (var page = 1; ; page++)
+            if (page.Number < page.TotalPages)
+            {
+                ReportProgress(search, (double)page.Number * CompletePercentage / page.TotalPages);
+            }
+        }
+
+        var resolution = properties.Resolve(options.EnableAgentNameFallback, cancellationToken);
+        foreach (var listing in resolution.Listings)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            yield return listing;
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        progress.Report(new ListingSearchProgress(search, CompletePercentage, resolution.Summary));
+    }
+
+    private async IAsyncEnumerable<(int Number, int TotalPages, FundaObject[] Objects)> FetchPagesAsync(
+        string query,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        var totalPages = 1;
+        for (var page = 1; page <= totalPages; page++)
         {
             cancellationToken.ThrowIfCancellationRequested();
             var response = await FetchPageAsync(query, page, cancellationToken);
             ValidateResponse(response, page);
 
-            if (totalPages is not null && totalPages != response.Paging.TotalPages)
+            if (page == 1)
             {
-                throw new FundaApiException("The number of pages changed during the search. Run the search again.");
-            }
-            totalPages ??= response.Paging.TotalPages;
-
-            if (response.Objects.Length == 0)
-            {
-                if (page == 1 && response.TotalObjectCount == 0 && totalPages <= 1)
-                {
-                    yield break;
-                }
-                throw new FundaApiException("The API returned an unexpected empty page.");
+                totalPages = response.Paging.TotalPages;
             }
 
-            // Detect repeated content even when the server increments its page metadata.
-            if (!response.Objects.Any(item => !seenIds.Contains(item.Id)))
-            {
-                throw new FundaApiException("The API repeated a page without any new listings.");
-            }
-
-            foreach (var item in response.Objects)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                seenIds.Add(item.Id);
-                yield return item.ToListing();
-            }
-
-            if (page == totalPages)
-            {
-                yield break;
-            }
+            yield return (page, totalPages, response.Objects);
         }
     }
 
+    private void ReportProgress(ListingSearch search, double percentage) =>
+        progress.Report(new ListingSearchProgress(search, percentage));
+
     private async Task<FundaResponse> FetchPageAsync(string query, int page, CancellationToken cancellationToken)
     {
-        // Append the escaped key as a path segment, not a relative URI that can replace the base path.
-            var url = options.BaseUrl.AbsoluteUri + Uri.EscapeDataString(options.ApiKey) +
+        // No leading slash: preserve the configured BaseAddress path.
+        var url = Uri.EscapeDataString(options.ApiKey) +
             "/?type=koop&zo=" + Uri.EscapeDataString(query) +
             "&page=" + page.ToString(CultureInfo.InvariantCulture) +
             "&pagesize=" + options.PageSize.ToString(CultureInfo.InvariantCulture);
 
         try
         {
-            using var response = await _requestPolicy.ExecuteAsync(async attemptToken =>
-            {
-                // Each retry gets a fresh request; HttpClient messages cannot be reused.
-                using var request = new HttpRequestMessage(HttpMethod.Get, url);
-                request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
-                return await httpClient.SendAsync(
-                    request, HttpCompletionOption.ResponseContentRead, attemptToken);
-            }, cancellationToken);
+            using var response = await requestPolicy.ExecuteAsync(
+                async attemptToken =>
+                {
+                    // Each retry gets a fresh request; HttpClient messages cannot be reused.
+                    using var request = new HttpRequestMessage(HttpMethod.Get, url);
+                    return await httpClient.SendAsync(
+                        request, HttpCompletionOption.ResponseContentRead, attemptToken);
+                },
+                cancellationToken);
+
             if (!response.IsSuccessStatusCode)
             {
                 throw new FundaApiException(
                     $"The API returned HTTP {(int)response.StatusCode}.", response.StatusCode);
             }
 
-            var json = await response.Content.ReadAsStringAsync(cancellationToken);
-            return JsonSerializer.Deserialize<FundaResponse>(json)
+            return await response.Content.ReadFromJsonAsync<FundaResponse>(
+                JsonSerializerOptions.Default, cancellationToken)
                 ?? throw new FundaApiException("The API returned a null response.");
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             throw new OperationCanceledException("The search was canceled.", cancellationToken);
         }
-        catch (OperationCanceledException)
+        catch (Exception exception) when (exception is TimeoutRejectedException or OperationCanceledException)
         {
             throw new FundaApiException("The API request timed out.");
         }
@@ -123,33 +142,17 @@ public sealed class FundaClient(HttpClient httpClient, FundaOptions options,
     {
         if (response.AccountStatus != 0 || response.EmailNotConfirmed || response.ValidationFailed)
         {
-            // Zero is the only successful account status verified in the supplied sample.
             throw new FundaApiException("The API reported an account or validation failure.");
         }
 
-        if (response.Objects is null || response.Paging is null ||
-            response.TotalObjectCount < 0 || response.Paging.TotalPages < 0 ||
-            response.Paging.CurrentPage != requestedPage ||
-            (response.Paging.TotalPages == 0 && response.TotalObjectCount != 0) ||
-            (response.Paging.TotalPages > 0 && requestedPage > response.Paging.TotalPages) ||
-            (response.Objects.Length > 0 && (response.TotalObjectCount == 0 || response.Paging.TotalPages == 0)))
+        if (response.Objects is null || response.Paging is null || response.Paging.TotalPages < 0)
         {
             throw new FundaApiException("The API returned invalid result or pagination data.");
         }
 
-        for (var index = 0; index < response.Objects.Length; index++)
+        if (response.Paging.CurrentPage != requestedPage)
         {
-            try
-            {
-                var item = response.Objects[index]
-                    ?? throw new InvalidDataException("Null listing.");
-                _ = item.ToListing();
-            }
-            catch (InvalidDataException)
-            {
-                throw new FundaApiException(
-                    $"The API returned an invalid or ambiguous listing identity on page {requestedPage}, object {index + 1}.");
-            }
+            throw new FundaApiException($"The API returned page {response.Paging.CurrentPage} when page {requestedPage} was requested.");
         }
     }
 }

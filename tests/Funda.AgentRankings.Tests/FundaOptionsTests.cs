@@ -1,243 +1,205 @@
 using Funda.AgentRankings.Configuration;
 using Funda.AgentRankings.Tests.ObjectMothers;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Options;
 
 namespace Funda.AgentRankings.Tests;
 
 public sealed class FundaOptionsTests
 {
-
     [Fact]
-    public void Load_When_OptionalSettingsAreAbsent_Then_ReturnsDefaultApiKey()
+    public void Validate_When_RequestSettingsAreAbsent_Then_PreservesDefaults()
     {
         // Arrange
-        var readVariable = FundaEnvironmentMother.CreateDefault();
+        var configuration = FundaConfigurationMother.CreateDefault();
+        using var provider = CreateDefaultProvider(configuration);
 
         // Act
-        var result = FundaOptions.Load(readVariable);
-
-        // Assert
-        Assert.Equal(FundaEnvironmentMother.TestKey, result.ApiKey);
-    }
-
-    [Fact]
-    public void Load_When_OptionalSettingsAreAbsent_Then_ReturnsDefaultBaseUrl()
-    {
-        // Arrange
-        var readVariable = FundaEnvironmentMother.CreateDefault();
-
-        // Act
-        var result = FundaOptions.Load(readVariable);
-
-        // Assert
-        Assert.Equal("https://candidate-excercise.funda.io/feeds/Aanbod.svc/json/", result.BaseUrl.AbsoluteUri);
-    }
-
-    [Fact]
-    public void Load_When_OptionalSettingsAreAbsent_Then_ReturnsDefaultPageSize()
-    {
-        // Arrange
-        var readVariable = FundaEnvironmentMother.CreateDefault();
-
-        // Act
-        var result = FundaOptions.Load(readVariable);
+        provider.GetRequiredService<IStartupValidator>().Validate();
+        var result = provider.GetRequiredService<IOptions<FundaOptions>>().Value;
 
         // Assert
         Assert.Equal(25, result.PageSize);
-    }
-
-    [Fact]
-    public void Load_When_OptionalSettingsAreAbsent_Then_ReturnsDefaultRequestTimeout()
-    {
-        // Arrange
-        var readVariable = FundaEnvironmentMother.CreateDefault();
-
-        // Act
-        var result = FundaOptions.Load(readVariable);
-
-        // Assert
         Assert.Equal(TimeSpan.FromSeconds(30), result.RequestTimeout);
-    }
-
-    [Fact]
-    public void Load_When_OptionalSettingsAreAbsent_Then_ReturnsDefaultRequestInterval()
-    {
-        // Arrange
-        var readVariable = FundaEnvironmentMother.CreateDefault();
-
-        // Act
-        var result = FundaOptions.Load(readVariable);
-
-        // Assert
-        Assert.Equal(TimeSpan.FromSeconds(1), result.RequestInterval);
-    }
-
-    [Fact]
-    public void Load_When_OptionalSettingsAreAbsent_Then_ReturnsDefaultMaxRetries()
-    {
-        // Arrange
-        var readVariable = FundaEnvironmentMother.CreateDefault();
-
-        // Act
-        var result = FundaOptions.Load(readVariable);
-
-        // Assert
+        Assert.Equal(TimeSpan.FromMilliseconds(650), result.RequestInterval);
         Assert.Equal(3, result.MaxRetries);
     }
 
     [Fact]
-    public void Load_When_BaseUrlIsOverridden_Then_ReturnsConfiguredBaseUrl()
+    public void Validate_When_EndpointIsAbsent_Then_UsesDefaultEndpointAndSuppliedKey()
     {
         // Arrange
-        var readVariable = FundaEnvironmentMother.CreateWithOverride("FUNDA_BASE_URL", "https://example.com/api/");
+        var configuration = FundaConfigurationMother.CreateDefault();
+        using var provider = CreateDefaultProvider(configuration);
 
         // Act
-        var result = FundaOptions.Load(readVariable);
+        provider.GetRequiredService<IStartupValidator>().Validate();
+        var result = provider.GetRequiredService<IOptions<FundaOptions>>().Value;
+
+        // Assert
+        Assert.Equal("https://candidate-excercise.funda.io/feeds/Aanbod.svc/json/", result.BaseUrl.AbsoluteUri);
+        Assert.Equal(FundaConfigurationMother.TestKey, result.ApiKey);
+    }
+
+    [Fact]
+    public void Validate_When_RequestSettingsAreConfigured_Then_PreservesConfiguredValues()
+    {
+        // Arrange
+        var configuration = CreateWithRequestOverrides();
+        using var provider = CreateDefaultProvider(configuration);
+
+        // Act
+        provider.GetRequiredService<IStartupValidator>().Validate();
+        var result = provider.GetRequiredService<IOptions<FundaOptions>>().Value;
+
+        // Assert
+        Assert.Equal(10, result.PageSize);
+        Assert.Equal(TimeSpan.FromSeconds(60), result.RequestTimeout);
+        Assert.Equal(TimeSpan.FromSeconds(2), result.RequestInterval);
+        Assert.Equal(0, result.MaxRetries);
+    }
+
+    [Fact]
+    public void Validate_When_BaseUrlIsConfigured_Then_PreservesConfiguredValue()
+    {
+        // Arrange
+        var configuration = FundaConfigurationMother.CreateWithOverride("Funda:BaseUrl", "https://example.com/api/");
+        using var provider = CreateDefaultProvider(configuration);
+
+        // Act
+        provider.GetRequiredService<IStartupValidator>().Validate();
+        var result = provider.GetRequiredService<IOptions<FundaOptions>>().Value;
 
         // Assert
         Assert.Equal("https://example.com/api/", result.BaseUrl.AbsoluteUri);
     }
 
-    [Fact]
-    public void Load_When_PageSizeIsOverridden_Then_ReturnsConfiguredPageSize()
+    [Theory]
+    [InlineData("FUNDA_API_KEY", null)]
+    [InlineData("FUNDA_API_KEY", "")]
+    [InlineData("FUNDA_API_KEY", " ")]
+    [InlineData("FUNDA_API_KEY", "key with spaces")]
+    [InlineData("FUNDA_API_KEY", "key\n")]
+    [InlineData("Funda:BaseUrl", "http://example.com/api/")]
+    [InlineData("Funda:BaseUrl", "/relative/")]
+    [InlineData("Funda:BaseUrl", "https://example.com/api")]
+    [InlineData("Funda:BaseUrl", "https://user:password@example.com/api/")]
+    [InlineData("Funda:BaseUrl", "https://example.com/api/?key=secret")]
+    [InlineData("Funda:BaseUrl", "https://example.com/api/#secret")]
+    [InlineData("Funda:BaseUrl", "")]
+    [InlineData("Funda:PageSize", "0")]
+    [InlineData("Funda:PageSize", "26")]
+    [InlineData("Funda:TimeoutSeconds", "0")]
+    [InlineData("Funda:TimeoutSeconds", "301")]
+    [InlineData("Funda:RequestIntervalMs", "649")]
+    [InlineData("Funda:RequestIntervalMs", "60001")]
+    [InlineData("Funda:MaxRetries", "-1")]
+    [InlineData("Funda:MaxRetries", "6")]
+    [InlineData("Funda:MaxRetries", "test-key-never-a-real-secret")]
+    [InlineData("Funda:MaxRetries", "")]
+    [InlineData("Funda:MaxRetries", "999999999999999999999")]
+    public void Validate_If_SettingIsInvalid_Then_ThrowsOptionsValidationException(string name, string? value)
     {
         // Arrange
-        var readVariable = FundaEnvironmentMother.CreateWithOverride("FUNDA_PAGE_SIZE", "10");
+        var configuration = FundaConfigurationMother.CreateWithOverride(name, value);
+        using var provider = CreateDefaultProvider(configuration);
 
         // Act
-        var result = FundaOptions.Load(readVariable);
+        var act = () => provider.GetRequiredService<IStartupValidator>().Validate();
 
         // Assert
-        Assert.Equal(10, result.PageSize);
-    }
-
-    [Fact]
-    public void Load_When_RequestTimeoutIsOverridden_Then_ReturnsConfiguredRequestTimeout()
-    {
-        // Arrange
-        var readVariable = FundaEnvironmentMother.CreateWithOverride("FUNDA_TIMEOUT_SECONDS", "60");
-
-        // Act
-        var result = FundaOptions.Load(readVariable);
-
-        // Assert
-        Assert.Equal(TimeSpan.FromSeconds(60), result.RequestTimeout);
-    }
-
-    [Fact]
-    public void Load_When_RequestIntervalIsOverridden_Then_ReturnsConfiguredRequestInterval()
-    {
-        // Arrange
-        var readVariable = FundaEnvironmentMother.CreateWithOverride("FUNDA_REQUEST_INTERVAL_MS", "2000");
-
-        // Act
-        var result = FundaOptions.Load(readVariable);
-
-        // Assert
-        Assert.Equal(TimeSpan.FromSeconds(2), result.RequestInterval);
-    }
-
-    [Fact]
-    public void Load_When_MaxRetriesIsOverridden_Then_ReturnsConfiguredMaxRetries()
-    {
-        // Arrange
-        var readVariable = FundaEnvironmentMother.CreateWithOverride("FUNDA_MAX_RETRIES", "0");
-
-        // Act
-        var result = FundaOptions.Load(readVariable);
-
-        // Assert
-        Assert.Equal(0, result.MaxRetries);
+        Assert.Throws<OptionsValidationException>(act);
     }
 
     [Theory]
-    [InlineData(null)]
-    [InlineData("")]
-    [InlineData(" ")]
-    [InlineData("key with spaces")]
-    [InlineData("key\n")]
-    public void Load_If_KeyIsMissingOrMalformed_Then_ThrowsInvalidOperationException(string? value)
+    [InlineData("FUNDA_API_KEY", "private key")]
+    [InlineData("Funda:BaseUrl", "https://user:password@example.com/api/?key=secret")]
+    [InlineData("Funda:MaxRetries", FundaConfigurationMother.TestKey)]
+    public void Validate_If_InvalidSettingContainsSensitiveValue_Then_OmitsValueFromError(string name, string value)
     {
         // Arrange
-        var readVariable = FundaEnvironmentMother.CreateWithOverride("FUNDA_API_KEY", value);
+        var configuration = FundaConfigurationMother.CreateWithOverride(name, value);
+        using var provider = CreateDefaultProvider(configuration);
 
         // Act
-        var act = () => FundaOptions.Load(readVariable);
+        var result = Record.Exception(() => provider.GetRequiredService<IStartupValidator>().Validate());
 
         // Assert
-        Assert.Throws<InvalidOperationException>(act);
-    }
-
-    [Theory]
-    [InlineData("http://example.com/api/")]
-    [InlineData("/relative/")]
-    [InlineData("https://example.com/api")]
-    [InlineData("https://user:password@example.com/api/")]
-    [InlineData("https://example.com/api/?key=secret")]
-    [InlineData("https://example.com/api/#secret")]
-    [InlineData("")]
-    public void Load_If_BaseUrlIsInvalid_Then_ThrowsInvalidOperationException(string value)
-    {
-        // Arrange
-        var readVariable = FundaEnvironmentMother.CreateWithOverride("FUNDA_BASE_URL", value);
-
-        // Act
-        var act = () => FundaOptions.Load(readVariable);
-
-        // Assert
-        Assert.Throws<InvalidOperationException>(act);
-    }
-
-    [Theory]
-    [InlineData("FUNDA_PAGE_SIZE", "0")]
-    [InlineData("FUNDA_PAGE_SIZE", "26")]
-    [InlineData("FUNDA_TIMEOUT_SECONDS", "0")]
-    [InlineData("FUNDA_TIMEOUT_SECONDS", "301")]
-    [InlineData("FUNDA_REQUEST_INTERVAL_MS", "999")]
-    [InlineData("FUNDA_REQUEST_INTERVAL_MS", "60001")]
-    [InlineData("FUNDA_MAX_RETRIES", "-1")]
-    [InlineData("FUNDA_MAX_RETRIES", "6")]
-    [InlineData("FUNDA_MAX_RETRIES", "test-key-never-a-real-secret")]
-    [InlineData("FUNDA_MAX_RETRIES", "")]
-    [InlineData("FUNDA_MAX_RETRIES", "999999999999999999999")]
-    public void Load_If_NumericSettingIsInvalid_Then_ThrowsInvalidOperationException(string name, string value)
-    {
-        // Arrange
-        var readVariable = FundaEnvironmentMother.CreateWithOverride(name, value);
-
-        // Act
-        var act = () => FundaOptions.Load(readVariable);
-
-        // Assert
-        Assert.Throws<InvalidOperationException>(act);
-    }
-
-    [Theory]
-    [InlineData("FUNDA_API_KEY", "private key", "Set FUNDA_API_KEY to a non-empty API key without whitespace or control characters.")]
-    [InlineData("FUNDA_BASE_URL", "https://user:password@example.com/api/?key=secret", "FUNDA_BASE_URL must be an absolute HTTPS URL ending in '/', without credentials, query, or fragment. Do not include the API key.")]
-    [InlineData("FUNDA_MAX_RETRIES", FundaEnvironmentMother.TestKey, "FUNDA_MAX_RETRIES must be an integer from 0 to 5.")]
-    public void Load_If_SettingContainsSensitiveInvalidValue_Then_ReturnsActionableErrorWithoutValue(
-        string name, string value, string expectedMessage)
-    {
-        // Arrange
-        var readVariable = FundaEnvironmentMother.CreateWithOverride(name, value);
-
-        // Act
-        var result = Record.Exception(() => FundaOptions.Load(readVariable));
-
-        // Assert
-        Assert.Equal(expectedMessage, result?.Message);
+        Assert.DoesNotContain(value, Assert.IsType<OptionsValidationException>(result).ToString());
     }
 
     [Fact]
     public void ToString_When_OptionsContainApiKey_Then_OmitsApiKey()
     {
         // Arrange
-        var options = FundaOptions.Load(FundaEnvironmentMother.CreateDefault());
+        var options = FundaConfigurationMother.CreateDefaultOptions();
 
         // Act
         var result = options.ToString();
 
         // Assert
-        Assert.DoesNotContain(FundaEnvironmentMother.TestKey, result);
+        Assert.DoesNotContain(FundaConfigurationMother.TestKey, result);
     }
+
+    [Theory]
+    [InlineData(null, false)]
+    [InlineData("true", true)]
+    public void Validate_When_NameFallbackFlagIsConfigured_Then_PreservesExpectedValue(string? configuredValue, bool expected)
+    {
+        // Arrange
+        var configuration = FundaConfigurationMother.CreateWithOverride("Funda:EnableAgentNameFallback", configuredValue);
+        using var provider = CreateDefaultProvider(configuration);
+
+        // Act
+        provider.GetRequiredService<IStartupValidator>().Validate();
+        var result = provider.GetRequiredService<IOptions<FundaOptions>>().Value;
+
+        // Assert
+        Assert.Equal(expected, result.EnableAgentNameFallback);
+    }
+
+    [Theory]
+    [InlineData(null, "section-key")]
+    [InlineData("legacy-key", "legacy-key")]
+    public void Validate_When_KeySourcesAreConfigured_Then_PrefersLegacyKeyOtherwiseSectionKey(
+        string? legacyKey, string expected)
+    {
+        // Arrange
+        var configuration = CreateWithKeySources(legacyKey);
+        using var provider = CreateDefaultProvider(configuration);
+
+        // Act
+        provider.GetRequiredService<IStartupValidator>().Validate();
+        var result = provider.GetRequiredService<IOptions<FundaOptions>>().Value;
+
+        // Assert
+        Assert.Equal(expected, result.ApiKey);
+    }
+
+    private static ServiceProvider CreateDefaultProvider(IConfiguration configuration)
+    {
+        var services = new ServiceCollection();
+        services.AddFundaOptions(configuration);
+        return services.BuildServiceProvider();
+    }
+
+    private static IConfigurationRoot CreateWithKeySources(string? legacyKey) =>
+        new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
+        {
+            ["Funda:ApiKey"] = "section-key",
+            ["FUNDA_API_KEY"] = legacyKey
+        }).Build();
+
+    private static IConfigurationRoot CreateWithRequestOverrides() =>
+        new ConfigurationBuilder()
+            .AddConfiguration(FundaConfigurationMother.CreateDefault())
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["Funda:PageSize"] = "10",
+                ["Funda:TimeoutSeconds"] = "60",
+                ["Funda:RequestIntervalMs"] = "2000",
+                ["Funda:MaxRetries"] = "0"
+            }).Build();
+
 }

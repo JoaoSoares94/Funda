@@ -1,9 +1,10 @@
 using System.Net.Http.Headers;
 using Funda.AgentRankings.Api;
-using Funda.AgentRankings.Configuration;
 using Funda.AgentRankings.Tests.ObjectMothers;
 using Funda.AgentRankings.Tests.TestUtilities;
+using Microsoft.Extensions.Time.Testing;
 using NSubstitute;
+using Polly.Timeout;
 
 namespace Funda.AgentRankings.Tests;
 
@@ -11,51 +12,59 @@ public sealed class FundaRequestPolicyTests
 {
     private readonly Func<CancellationToken, Task<HttpResponseMessage>> _send =
         Substitute.For<Func<CancellationToken, Task<HttpResponseMessage>>>();
-    private readonly Func<double> _nextJitter = Substitute.For<Func<double>>();
-    private readonly VirtualRequestTiming _timing;
+    private readonly FakeTimeProvider _timeProvider;
     private readonly FundaRequestPolicy _sut;
 
     public FundaRequestPolicyTests()
     {
-        _timing = FundaRequestPolicyMother.CreateDefaultTiming();
+        _timeProvider = new FakeTimeProvider();
         _sut = new FundaRequestPolicy(
-            FundaOptions.Load(FundaEnvironmentMother.CreateDefault()), _timing, _nextJitter);
+            FundaConfigurationMother.CreateDefaultOptions(), _timeProvider);
     }
 
     [Fact]
-    public async Task ExecuteAsync_When_FirstRequestSucceeds_Then_DoesNotDelay()
+    public async Task ExecuteAsync_When_FirstRequestSucceeds_Then_DoesNotAdvanceTime()
     {
         // Arrange
+        var started = _timeProvider.GetUtcNow();
         _send(Arg.Any<CancellationToken>()).Returns(_ => FundaHttpResponseMother.CreateDefault());
 
         // Act
         using var result = await _sut.ExecuteAsync(_send);
 
         // Assert
-        Assert.Empty(_timing.Delays);
+        Assert.Equal(started, _timeProvider.GetUtcNow());
     }
 
     [Fact]
-    public async Task ExecuteAsync_When_TwoSearchesSharePolicy_Then_SpacesRequestsByOneSecond()
+    public async Task ExecuteAsync_When_TwoSearchesSharePolicy_Then_SpacesRequestsBy650Milliseconds()
     {
         // Arrange
-        _send(Arg.Any<CancellationToken>()).Returns(_ => FundaHttpResponseMother.CreateDefault());
+        var times = CreateDefaultAttemptTimes();
+        _send(Arg.Any<CancellationToken>()).Returns(_ =>
+        {
+            times.Add(_timeProvider.GetTimestamp());
+            return FundaHttpResponseMother.CreateDefault();
+        });
 
         // Act
         using var first = await _sut.ExecuteAsync(_send);
-        using var second = await _sut.ExecuteAsync(_send);
+        var secondOperation = _sut.ExecuteAsync(_send);
+        _timeProvider.Advance(TimeSpan.FromMilliseconds(650));
+        using var second = await secondOperation.WaitAsync(TimeSpan.FromSeconds(5));
 
         // Assert
-        Assert.Equal(TimeSpan.FromSeconds(1), _timing.Delays.Single());
+        Assert.Equal(TimeSpan.FromMilliseconds(650), _timeProvider.GetElapsedTime(times[0], times[1]));
     }
 
     [Fact]
-    public async Task ExecuteAsync_When_PreviousRequestTakesLongerThanInterval_Then_DoesNotAddPacingDelay()
+    public async Task ExecuteAsync_When_PreviousAttemptTookLongerThanInterval_Then_DoesNotAddPacingDelay()
     {
         // Arrange
+        var started = _timeProvider.GetUtcNow();
         _send(Arg.Any<CancellationToken>()).Returns(_ =>
         {
-            _timing.Advance(TimeSpan.FromSeconds(2));
+            _timeProvider.Advance(TimeSpan.FromSeconds(2));
             return FundaHttpResponseMother.CreateDefault();
         });
 
@@ -64,7 +73,7 @@ public sealed class FundaRequestPolicyTests
         using var second = await _sut.ExecuteAsync(_send);
 
         // Assert
-        Assert.Empty(_timing.Delays);
+        Assert.Equal(TimeSpan.FromSeconds(4), _timeProvider.GetUtcNow() - started);
     }
 
     [Theory]
@@ -74,7 +83,7 @@ public sealed class FundaRequestPolicyTests
     [InlineData(502)]
     [InlineData(503)]
     [InlineData(504)]
-    public async Task ExecuteAsync_If_TransientStatusIsFollowedBySuccess_Then_ReturnsSuccessfulResponse(int status)
+    public async Task ExecuteAsync_If_TransientStatusIsFollowedBySuccess_Then_ReturnsSuccess(int status)
     {
         // Arrange
         var attempt = 0;
@@ -83,7 +92,7 @@ public sealed class FundaRequestPolicyTests
             : FundaHttpResponseMother.CreateDefault());
 
         // Act
-        using var result = await _sut.ExecuteAsync(_send);
+        using var result = await FakeTimeExecution.CompleteAsync(_sut.ExecuteAsync(_send), _timeProvider);
 
         // Assert
         Assert.True(result.IsSuccessStatusCode);
@@ -108,93 +117,89 @@ public sealed class FundaRequestPolicyTests
     }
 
     [Fact]
-    public async Task ExecuteAsync_If_TransientFailuresContinue_Then_StopsAfterThreeRetries()
+    public async Task ExecuteAsync_If_TransientFailuresContinue_Then_PacesEveryAttemptAndStopsAfterConfiguredRetries()
     {
         // Arrange
-        _send(Arg.Any<CancellationToken>()).Returns(_ => FundaHttpResponseMother.CreateWithStatus(429));
-
-        // Act
-        using var result = await _sut.ExecuteAsync(_send);
-
-        // Assert
-        Assert.Equal(4, _send.ReceivedCalls().Count());
-    }
-
-    [Fact]
-    public async Task ExecuteAsync_If_TransientFailuresContinue_Then_UsesIncreasingBackoffWithoutExtraPacingWait()
-    {
-        // Arrange
-        var times = FundaRequestPolicyMother.CreateDefaultAttemptTimes();
+        var times = CreateDefaultAttemptTimes();
+        var attemptsStarted = CreateDefaultAttemptSignals();
+        var retriedEarly = false;
         _send(Arg.Any<CancellationToken>()).Returns(_ =>
         {
-            times.Add(_timing.GetTimestamp());
-            return FundaHttpResponseMother.CreateWithStatus(503);
+            times.Add(_timeProvider.GetTimestamp());
+            attemptsStarted[times.Count - 1].SetResult();
+            return CreateWithRetryAfter(false, 0);
         });
 
         // Act
-        using var result = await _sut.ExecuteAsync(_send);
+        var operation = _sut.ExecuteAsync(_send);
+        for (var retry = 1; retry < attemptsStarted.Length; retry++)
+        {
+            _timeProvider.Advance(TimeSpan.FromMilliseconds(649));
+            retriedEarly |= times.Count != retry;
+            _timeProvider.Advance(TimeSpan.FromMilliseconds(1));
+            await attemptsStarted[retry].Task.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+        using var result = await operation.WaitAsync(TimeSpan.FromSeconds(5));
 
         // Assert
-        Assert.Equal(FundaRequestPolicyMother.CreateWithExpectedBackoffTimes(), times);
-    }
-
-    [Fact]
-    public async Task ExecuteAsync_If_JitterIsEnabled_Then_AddsJitterToBackoff()
-    {
-        // Arrange
-        var attempt = 0;
-        _nextJitter().Returns(0.5);
-        _send(Arg.Any<CancellationToken>()).Returns(_ => ++attempt == 1
-            ? FundaHttpResponseMother.CreateWithStatus(429)
-            : FundaHttpResponseMother.CreateDefault());
-
-        // Act
-        using var result = await _sut.ExecuteAsync(_send);
-
-        // Assert
-        Assert.Equal(TimeSpan.FromSeconds(1.25), _timing.Delays.Single());
+        Assert.False(retriedEarly);
+        Assert.Equal(4, times.Count);
+        Assert.All(times.Zip(times.Skip(1)), pair =>
+            Assert.Equal(TimeSpan.FromMilliseconds(650), _timeProvider.GetElapsedTime(pair.First, pair.Second)));
     }
 
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
-    public async Task ExecuteAsync_If_ServerSuppliesRetryAfter_Then_WaitsAtLeastServerDelay(bool useDate)
+    public async Task ExecuteAsync_If_ServerSuppliesRetryAfter_Then_UsesInjectedClockOutsideAttemptTimeout(bool useDate)
     {
         // Arrange
-        var attempt = 0;
-        _send(Arg.Any<CancellationToken>()).Returns(_ => ++attempt == 1
-            ? CreateWithRetryAfter(useDate, 10)
-            : FundaHttpResponseMother.CreateDefault());
+        const int seconds = 60;
+        var times = CreateDefaultAttemptTimes();
+        _send(Arg.Any<CancellationToken>()).Returns(_ =>
+        {
+            times.Add(_timeProvider.GetTimestamp());
+            return times.Count == 1 ? CreateWithRetryAfter(useDate, seconds)
+                : FundaHttpResponseMother.CreateDefault();
+        });
 
         // Act
-        using var result = await _sut.ExecuteAsync(_send);
+        var operation = _sut.ExecuteAsync(_send);
+        _timeProvider.Advance(TimeSpan.FromSeconds(seconds - 1));
+        _timeProvider.Advance(TimeSpan.FromSeconds(1));
+        using var result = await operation.WaitAsync(TimeSpan.FromSeconds(5));
 
         // Assert
-        Assert.Equal(TimeSpan.FromSeconds(10), _timing.Delays.Single());
+        Assert.Equal(TimeSpan.FromSeconds(seconds), _timeProvider.GetElapsedTime(times[0], times[1]));
     }
 
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
-    public async Task ExecuteAsync_If_RetryAfterHasElapsed_Then_StillUsesBackoff(bool useDate)
+    public async Task ExecuteAsync_If_ServerDelayHasElapsed_Then_StillAppliesPacing(bool useDate)
     {
         // Arrange
-        var attempt = 0;
-        _send(Arg.Any<CancellationToken>()).Returns(_ => ++attempt == 1
-            ? CreateWithRetryAfter(useDate, 0)
-            : FundaHttpResponseMother.CreateDefault());
+        var times = CreateDefaultAttemptTimes();
+        _send(Arg.Any<CancellationToken>()).Returns(_ =>
+        {
+            times.Add(_timeProvider.GetTimestamp());
+            return times.Count == 1 ? CreateWithRetryAfter(useDate, 0)
+                : FundaHttpResponseMother.CreateDefault();
+        });
 
         // Act
-        using var result = await _sut.ExecuteAsync(_send);
+        var operation = _sut.ExecuteAsync(_send);
+        _timeProvider.Advance(TimeSpan.FromMilliseconds(650));
+        using var result = await operation.WaitAsync(TimeSpan.FromSeconds(5));
 
         // Assert
-        Assert.Equal(TimeSpan.FromSeconds(1), _timing.Delays.Single());
+        Assert.Equal(TimeSpan.FromMilliseconds(650), _timeProvider.GetElapsedTime(times[0], times[1]));
     }
 
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
-    public async Task ExecuteAsync_If_TransportFailureIsTransient_Then_RetriesAndReturnsSuccess(bool timeout)
+    public async Task ExecuteAsync_If_TransportFailureIsTransient_Then_Retries(bool timeout)
     {
         // Arrange
         var attempt = 0;
@@ -209,47 +214,33 @@ public sealed class FundaRequestPolicyTests
         });
 
         // Act
-        using var result = await _sut.ExecuteAsync(_send);
+        using var result = await FakeTimeExecution.CompleteAsync(_sut.ExecuteAsync(_send), _timeProvider);
 
         // Assert
         Assert.True(result.IsSuccessStatusCode);
     }
 
     [Fact]
-    public async Task ExecuteAsync_If_CallerCancelsDuringBackoff_Then_DoesNotSendAnotherAttempt()
+    public async Task ExecuteAsync_If_CallerCancelsDuringPacing_Then_ThrowsCancellation()
     {
         // Arrange
-        using var source = FundaRequestPolicyMother.CreateDefaultCancellationSource();
-        _timing.OnDelay = source.Cancel;
-        _send(Arg.Any<CancellationToken>()).Returns(_ => FundaHttpResponseMother.CreateWithStatus(429));
+        using var source = CreateDefaultCancellationSource();
+        _send(Arg.Any<CancellationToken>()).Returns(_ => FundaHttpResponseMother.CreateDefault());
+        using var first = await _sut.ExecuteAsync(_send);
 
         // Act
-        await Record.ExceptionAsync(() => _sut.ExecuteAsync(_send, source.Token));
+        var operation = _sut.ExecuteAsync(_send, source.Token);
+        source.Cancel();
 
         // Assert
-        Assert.Single(_send.ReceivedCalls());
-    }
-
-    [Fact]
-    public async Task ExecuteAsync_If_CallerCancelsDuringBackoff_Then_ThrowsOperationCanceledException()
-    {
-        // Arrange
-        using var source = FundaRequestPolicyMother.CreateDefaultCancellationSource();
-        _timing.OnDelay = source.Cancel;
-        _send(Arg.Any<CancellationToken>()).Returns(_ => FundaHttpResponseMother.CreateWithStatus(429));
-
-        // Act
-        var act = () => _sut.ExecuteAsync(_send, source.Token);
-
-        // Assert
-        await Assert.ThrowsAsync<OperationCanceledException>(act);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => operation);
     }
 
     [Fact]
     public async Task ExecuteAsync_If_CallerCancelsDuringRequest_Then_DoesNotRetry()
     {
         // Arrange
-        using var source = FundaRequestPolicyMother.CreateDefaultCancellationSource();
+        using var source = CreateDefaultCancellationSource();
         _send(Arg.Any<CancellationToken>()).Returns<HttpResponseMessage>(_ =>
         {
             source.Cancel();
@@ -264,25 +255,30 @@ public sealed class FundaRequestPolicyTests
     }
 
     [Fact]
-    public async Task ExecuteAsync_If_CanceledWaitReleasesGate_Then_AllowsFollowingRequest()
+    public async Task ExecuteAsync_If_CallerCancelsDuringBackoff_Then_StopsRetriesAndAllowsFollowingRequest()
     {
         // Arrange
-        using var source = FundaRequestPolicyMother.CreateDefaultCancellationSource();
-        _timing.OnDelay = source.Cancel;
-        _send(Arg.Any<CancellationToken>()).Returns(_ => FundaHttpResponseMother.CreateWithStatus(429));
-        await Record.ExceptionAsync(() => _sut.ExecuteAsync(_send, source.Token));
-        _timing.OnDelay = null;
-        _send(Arg.Any<CancellationToken>()).Returns(_ => FundaHttpResponseMother.CreateDefault());
+        using var source = CreateDefaultCancellationSource();
+        _send(Arg.Any<CancellationToken>()).Returns(_ => CreateWithRetryAfter(false, 60));
 
         // Act
-        using var result = await _sut.ExecuteAsync(_send);
+        var operation = _sut.ExecuteAsync(_send, source.Token);
+        source.Cancel();
+        var cancellation = await Record.ExceptionAsync(() => operation.WaitAsync(TimeSpan.FromSeconds(5)));
+        var attemptsBeforeFollowingRequest = _send.ReceivedCalls().Count();
+        _send(Arg.Any<CancellationToken>()).Returns(_ => FundaHttpResponseMother.CreateDefault());
+        var next = _sut.ExecuteAsync(_send);
+        _timeProvider.Advance(TimeSpan.FromMilliseconds(650));
+        using var result = await next.WaitAsync(TimeSpan.FromSeconds(5));
 
         // Assert
+        Assert.IsAssignableFrom<OperationCanceledException>(cancellation);
+        Assert.Equal(1, attemptsBeforeFollowingRequest);
         Assert.True(result.IsSuccessStatusCode);
     }
 
     [Fact]
-    public async Task ExecuteAsync_When_SearchesOverlap_Then_QueuesSecondSearchUntilFirstCompletes()
+    public async Task ExecuteAsync_When_SearchesOverlap_Then_QueuesSecondSearch()
     {
         // Arrange
         var completion = CreateDefaultPendingResponse();
@@ -296,38 +292,68 @@ public sealed class FundaRequestPolicyTests
         var attemptsBeforeRelease = _send.ReceivedCalls().Count();
         completion.SetResult(FundaHttpResponseMother.CreateDefault());
         using var firstResult = await first;
-        using var secondResult = await second;
+        _timeProvider.Advance(TimeSpan.FromMilliseconds(650));
+        using var secondResult = await second.WaitAsync(TimeSpan.FromSeconds(5));
 
         // Assert
         Assert.Equal(1, attemptsBeforeRelease);
     }
 
     [Fact]
-    public async Task ExecuteAsync_If_ResponseIsRetried_Then_DisposesFailedResponseBeforeWaiting()
+    public async Task ExecuteAsync_If_ResponseIsRetried_Then_DisposesResponseBeforeBackoff()
     {
         // Arrange
-        var failure = FundaHttpResponseMother.CreateWithStatus(429);
-        var attempt = 0;
-        _send(Arg.Any<CancellationToken>()).Returns(_ => ++attempt == 1
-            ? failure : FundaHttpResponseMother.CreateDefault());
-        Exception? disposalError = null;
-        _timing.OnDelay = () => disposalError = Record.Exception(() => failure.Content.ReadAsStream());
+        var failure = CreateWithRetryAfter(false, 60);
+        _send(Arg.Any<CancellationToken>()).Returns(_ => failure);
+        using var source = CreateDefaultCancellationSource();
 
         // Act
-        using var result = await _sut.ExecuteAsync(_send);
+        var operation = _sut.ExecuteAsync(_send, source.Token);
+        var disposalError = Record.Exception(() => failure.Content.ReadAsStream());
+        source.Cancel();
+        await Record.ExceptionAsync(() => operation);
 
         // Assert
         Assert.IsType<ObjectDisposedException>(disposalError);
     }
 
-    private static TaskCompletionSource<HttpResponseMessage> CreateDefaultPendingResponse() =>
-        new(TaskCreationOptions.RunContinuationsAsynchronously);
+    [Fact]
+    public async Task ExecuteAsync_If_AttemptTimesOut_Then_RetriesAndReturnsSuccess()
+    {
+        // Arrange
+        var attempt = 0;
+        _send(Arg.Any<CancellationToken>()).Returns(call => ++attempt == 1
+            ? WaitUntilCanceledAsync(call.Arg<CancellationToken>())
+            : Task.FromResult(FundaHttpResponseMother.CreateDefault()));
+
+        // Act
+        var operation = _sut.ExecuteAsync(_send);
+        _timeProvider.Advance(TimeSpan.FromSeconds(30));
+        using var result = await FakeTimeExecution.CompleteAsync(operation, _timeProvider);
+
+        // Assert
+        Assert.True(result.IsSuccessStatusCode);
+    }
+
     private HttpResponseMessage CreateWithRetryAfter(bool useDate, int seconds)
     {
         var response = FundaHttpResponseMother.CreateWithStatus(429);
         response.Headers.RetryAfter = useDate
-            ? new RetryConditionHeaderValue(_timing.UtcNow.AddSeconds(seconds))
+            ? new RetryConditionHeaderValue(_timeProvider.GetUtcNow().AddSeconds(seconds))
             : new RetryConditionHeaderValue(TimeSpan.FromSeconds(seconds));
         return response;
     }
+
+    private static async Task<HttpResponseMessage> WaitUntilCanceledAsync(CancellationToken token)
+    {
+        await Task.Delay(Timeout.InfiniteTimeSpan, token);
+        throw new InvalidOperationException("An infinite delay completed without cancellation.");
+    }
+
+    private static TaskCompletionSource<HttpResponseMessage> CreateDefaultPendingResponse() =>
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private static TaskCompletionSource[] CreateDefaultAttemptSignals() =>
+        Enumerable.Range(0, 4).Select(_ => new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)).ToArray();
+    private static CancellationTokenSource CreateDefaultCancellationSource() => new();
+    private static List<long> CreateDefaultAttemptTimes() => [];
 }

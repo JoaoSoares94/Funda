@@ -1,26 +1,44 @@
-﻿using Funda.AgentRankings.Rankings;
+using Funda.AgentRankings.Rankings;
+using Spectre.Console;
+using System.Globalization;
 
 namespace Funda.AgentRankings.Output;
 
 public sealed class ConsoleReportWriter(TextWriter output)
 {
+    private readonly IAnsiConsole _console = AnsiConsole.Create(new AnsiConsoleSettings
+    {
+        Out = new AnsiConsoleOutput(output),
+        Ansi = AnsiSupport.No,
+        Interactive = InteractionSupport.No
+    });
+
     public void Write(string title, IReadOnlyList<AgentRanking> rankings)
     {
-        output.WriteLine(title);
+        _console.WriteLine(title);
         if (rankings.Count == 0)
         {
-            output.WriteLine("No listings found.");
-            output.WriteLine();
+            _console.WriteLine("No rankable listings found.");
+            _console.WriteLine();
             return;
         }
 
-        output.WriteLine($"{"Rank",4}  {"Agent ID",10}  {"Listings",8}  Agent");
+        var table = new Table().Border(TableBorder.Ascii)
+            .AddColumn(new TableColumn("Rank").RightAligned())
+            .AddColumn(new TableColumn("Agent ID").RightAligned())
+            .AddColumn(new TableColumn("Listings").RightAligned())
+            .AddColumn("Agent");
         for (var index = 0; index < rankings.Count; index++)
         {
             var agent = rankings[index];
             var name = string.Concat(agent.AgentName.Select(character => char.IsControl(character) ? ' ' : character));
-            output.WriteLine($"{index + 1,4}  {agent.AgentId,10}  {agent.ListingCount,8}  {name}");
+            table.AddRow(
+                new Text((index + 1).ToString(CultureInfo.InvariantCulture)),
+                new Text(agent.AgentId.ToString(CultureInfo.InvariantCulture)),
+                new Text(agent.ListingCount.ToString(CultureInfo.InvariantCulture)),
+                new Text(name));
         }
-        output.WriteLine();
+        _console.Write(table);
+        _console.WriteLine();
     }
 }

@@ -1,21 +1,28 @@
-﻿using Funda.AgentRankings.Configuration;
+using System.Net.Http.Headers;
+using Funda.AgentRankings.Configuration;
 using Funda.AgentRankings.Listings;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Options;
 
 namespace Funda.AgentRankings.Api;
 
 public static class FundaServiceCollectionExtensions
 {
-    public static IHttpClientBuilder AddFundaApi(this IServiceCollection services, FundaOptions options)
+    public static IHttpClientBuilder AddFundaApi(this IServiceCollection services, IConfiguration configuration)
     {
-        services.AddSingleton(options);
+        services.AddFundaOptions(configuration);
+        services.AddSingleton(provider => provider.GetRequiredService<IOptions<FundaOptions>>().Value);
         // Typed clients are transient; the request budget must survive client recreation.
-        services.AddSingleton(_ => new FundaRequestPolicy(
-            options, SystemRequestTiming.Instance, Random.Shared.NextDouble));
+        services.TryAddSingleton<TimeProvider>(TimeProvider.System);
+        services.AddSingleton<FundaRequestPolicy>();
 
-        return services.AddHttpClient<IListingSource, FundaClient>(client =>
+        return services.AddHttpClient<IListingSource, FundaClient>((provider, client) =>
             {
+                var options = provider.GetRequiredService<FundaOptions>();
                 client.BaseAddress = options.BaseUrl;
+                client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
                 client.Timeout = Timeout.InfiniteTimeSpan;
             })
             .ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler { AllowAutoRedirect = false })
